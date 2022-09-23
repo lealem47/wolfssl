@@ -556,8 +556,10 @@ typedef struct SnifferSession {
 
 
 /* Sniffer Server List and mutex */
-static WOLFSSL_GLOBAL SnifferServer* ServerList = NULL;
+static THREAD_LS_T WOLFSSL_GLOBAL SnifferServer* ServerList = NULL;
+#ifndef HAVE_C___ATOMIC
 static WOLFSSL_GLOBAL wolfSSL_Mutex ServerListMutex;
+#endif
 
 /* Session Hash Table, mutex, and count */
 static THREAD_LS_T WOLFSSL_GLOBAL SnifferSession* SessionTable[HASH_SIZE];
@@ -633,9 +635,13 @@ static void UpdateMissedDataSessions(void)
 #ifdef HAVE_C___ATOMIC
     #define LOCK_SESSION()
     #define UNLOCK_SESSION()
+    #define LOCK_SERVER_LIST()
+    #define UNLOCK_SERVER_LIST()
 #else
     #define LOCK_SESSION() wc_LockMutex(&SessionMutex)
     #define UNLOCK_SESSION() wc_UnLockMutex(&SessionMutex)
+    #define LOCK_SERVER_LIST() wc_LockMutex(&ServerListMutex)
+    #define UNLOCK_SERVER_LIST() wc_UnLockMutex(&ServerListMutex)
 #endif
 
 
@@ -648,8 +654,8 @@ static void UpdateMissedDataSessions(void)
 void ssl_InitSniffer_ex(int devId)
 {
     wolfSSL_Init();
-    wc_InitMutex(&ServerListMutex);
 #ifndef HAVE_C___ATOMIC
+    wc_InitMutex(&ServerListMutex);
     wc_InitMutex(&SessionMutex);
 #endif
 #ifndef WOLFSSL_SNIFFER_NO_RECOVERY
@@ -804,7 +810,7 @@ void ssl_FreeSniffer(void)
     SnifferSession* removeSession;
     int i;
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     LOCK_SESSION();
 
     /* Free sessions (wolfSSL objects) first */
@@ -828,14 +834,14 @@ void ssl_FreeSniffer(void)
     ServerList = NULL;
 
     UNLOCK_SESSION();
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 #ifndef WOLFSSL_SNIFFER_NO_RECOVERY
     wc_FreeMutex(&RecoveryMutex);
 #endif
 #ifndef HAVE_C___ATOMIC
     wc_FreeMutex(&SessionMutex);
-#endif
     wc_FreeMutex(&ServerListMutex);
+#endif
 
 #ifdef WOLF_CRYPTO_CB
     #ifdef HAVE_INTEL_QA_SYNC
@@ -1384,7 +1390,7 @@ static int IsServerRegistered(word32 addr)
     int ret = 0;     /* false */
     SnifferServer* sniffer;
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
 
     sniffer = ServerList;
     while (sniffer) {
@@ -1395,7 +1401,7 @@ static int IsServerRegistered(word32 addr)
         sniffer = sniffer->next;
     }
 
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     return ret;
 }
@@ -1409,7 +1415,7 @@ static int IsServerRegistered6(byte* addr)
     int ret = 0;     /* false */
     SnifferServer* sniffer;
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
 
     sniffer = ServerList;
     while (sniffer) {
@@ -1421,7 +1427,7 @@ static int IsServerRegistered6(byte* addr)
         sniffer = sniffer->next;
     }
 
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     return ret;
 }
@@ -1434,7 +1440,7 @@ static int IsPortRegistered(word32 port)
     int ret = 0;    /* false */
     SnifferServer* sniffer;
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
 
     sniffer = ServerList;
     while (sniffer) {
@@ -1445,7 +1451,7 @@ static int IsPortRegistered(word32 port)
         sniffer = sniffer->next;
     }
 
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     return ret;
 }
@@ -1458,7 +1464,7 @@ static SnifferServer* GetSnifferServer(IpInfo* ipInfo, TcpInfo* tcpInfo)
 {
     SnifferServer* sniffer;
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
 
     sniffer = ServerList;
 
@@ -1478,7 +1484,7 @@ static SnifferServer* GetSnifferServer(IpInfo* ipInfo, TcpInfo* tcpInfo)
     (void)tcpInfo;
 #endif
 
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     return sniffer;
 }
@@ -1673,10 +1679,10 @@ static int CreateWatchSnifferServer(char* error)
 #endif
 
     /* add to server list */
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     sniffer->next = ServerList;
     ServerList = sniffer;
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     return 0;
 }
@@ -1848,10 +1854,10 @@ int ssl_SetNamedPrivateKey(const char* name,
     TraceHeader();
     TraceSetNamedServer(name, address, port, keyFile);
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(name, address, port, keyFile, 0,
                              typeKey, password, error, 0);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -1869,10 +1875,10 @@ int ssl_SetNamedPrivateKeyBuffer(const char* name,
     TraceHeader();
     TraceSetNamedServer(name, address, port, NULL);
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(name, address, port, keyBuf, keySz,
                              typeKey, password, error, 0);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -1892,10 +1898,10 @@ int ssl_SetPrivateKey(const char* address, int port,
     TraceHeader();
     TraceSetServer(address, port, keyFile);
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(NULL, address, port, keyFile, 0,
                              typeKey, password, error, 0);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -1912,10 +1918,10 @@ int ssl_SetPrivateKeyBuffer(const char* address, int port,
     TraceHeader();
     TraceSetServer(address, port, "from buffer");
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(NULL, address, port, keyBuf, keySz,
                              typeKey, password, error, 0);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -1937,10 +1943,10 @@ int ssl_SetNamedEphemeralKey(const char* name,
     TraceHeader();
     TraceSetNamedServer(name, address, port, keyFile);
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(name, address, port, keyFile, 0,
                              typeKey, password, error, 1);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -1958,10 +1964,10 @@ int ssl_SetNamedEphemeralKeyBuffer(const char* name,
     TraceHeader();
     TraceSetNamedServer(name, address, port, NULL);
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(name, address, port, keyBuf, keySz,
                              typeKey, password, error, 1);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -1981,10 +1987,10 @@ int ssl_SetEphemeralKey(const char* address, int port,
     TraceHeader();
     TraceSetServer(address, port, keyFile);
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(NULL, address, port, keyFile, 0,
                              typeKey, password, error, 1);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -2001,10 +2007,10 @@ int ssl_SetEphemeralKeyBuffer(const char* address, int port,
     TraceHeader();
     TraceSetServer(address, port, "from buffer");
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
     ret = SetNamedPrivateKey(NULL, address, port, keyBuf, keySz,
                              typeKey, password, error, 1);
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
     if (ret == 0)
         Trace(NEW_SERVER_STR);
@@ -6899,7 +6905,7 @@ int ssl_PollSniffer(WOLF_EVENT** events, int maxEvents, WOLF_EVENT_FLAG flags,
     int i;
     SnifferServer* srv;
 
-    wc_LockMutex(&ServerListMutex);
+    LOCK_SERVER_LIST();
 
     /* Iterate the open sniffer sessions calling wolfSSL_CTX_AsyncPoll */
     srv = ServerList;
@@ -6922,11 +6928,11 @@ int ssl_PollSniffer(WOLF_EVENT** events, int maxEvents, WOLF_EVENT_FLAG flags,
         srv = srv->next;
     }
 
-    wc_UnLockMutex(&ServerListMutex);
+    UNLOCK_SERVER_LIST();
 
 
     /* iterate list and mark polled */
-    wc_LockMutex(&SessionMutex);
+    LOCK_SESSION();
     for (i=0; i<eventCount; i++) {
         WOLFSSL* ssl = (WOLFSSL*)events[i]->context;
         SnifferSession* session = FindSession(ssl);
@@ -6934,7 +6940,7 @@ int ssl_PollSniffer(WOLF_EVENT** events, int maxEvents, WOLF_EVENT_FLAG flags,
             session->flags.wasPolled = 1;
         }
     }
-    wc_UnLockMutex(&SessionMutex);
+    UNLOCK_SESSION();
 
     *pEventCount = eventCount;
 
