@@ -151,6 +151,7 @@ enum {
     TRACE_MSG_SZ       = 80,  /* Trace Message buffer size */
     HASH_SIZE          = 499, /* Session Hash Table Rows */
     PSEUDO_HDR_SZ      = 12,  /* TCP Pseudo Header size in bytes */
+    STREAM_INFO_SZ     = 44,  /* SnifferStreamInfo size in bytes */
     FATAL_ERROR_STATE  = 1,   /* SnifferSession fatal error state */
     TICKET_HINT_LEN    = 4,   /* Session Ticket Hint length */
     TICKET_HINT_AGE_LEN= 4,   /* Session Ticket Age add length */
@@ -415,16 +416,6 @@ typedef struct NamedKey {
 } NamedKey;
 
 #endif
-
-
-typedef struct IpAddrInfo {
-    int version;
-    union {
-        word32 ip4;
-        byte   ip6[16];
-    };
-} IpAddrInfo;
-
 
 /* Sniffer Server holds info for each server/port monitored */
 typedef struct SnifferServer {
@@ -2092,13 +2083,6 @@ static int CheckIpHdr(IpHdr* iphdr, IpInfo* info, int length, char* error)
         return -1;
     }
 
-#ifndef WOLFSSL_SNIFFER_WATCH
-    if (!IsServerRegistered(iphdr->src) && !IsServerRegistered(iphdr->dst)) {
-        SetError(SERVER_NOT_REG_STR, error, NULL, 0);
-        return -1;
-    }
-#endif
-
     info->length  = IP_HL(iphdr);
     info->total   = XNTOHS(iphdr->length);
     info->src.version = IPV4;
@@ -2130,14 +2114,7 @@ static int CheckTcpHdr(TcpHdr* tcphdr, TcpInfo* info, char* error)
     if (info->ack)
         info->ackNumber = XNTOHL(tcphdr->ack);
 
-#ifndef WOLFSSL_SNIFFER_WATCH
-    if (!IsPortRegistered(info->srcPort) && !IsPortRegistered(info->dstPort)) {
-        SetError(SERVER_PORT_NOT_REG_STR, error, NULL, 0);
-        return -1;
-    }
-#else
     (void)error;
-#endif
 
     return 0;
 }
@@ -5109,7 +5086,7 @@ static int DoOldHello(SnifferSession* session, const byte* sslFrame,
    TcpChecksum(&ipInfo, &tcpInfo, sslBytes, packet + ipInfo.length);
    could also add a 64bit version if type available and using this
 */
-int TcpChecksum(IpInfo* ipInfo, TcpInfo* tcpInfo, int dataLen,
+static int TcpChecksum(IpInfo* ipInfo, TcpInfo* tcpInfo, int dataLen,
                 const byte* packet)
 {
     TcpPseudoHdr  pseudo;
@@ -5118,8 +5095,8 @@ int TcpChecksum(IpInfo* ipInfo, TcpInfo* tcpInfo, int dataLen,
     word32        sum = 0;
     word16        checksum;
 
-    pseudo.src = ipInfo->src;
-    pseudo.dst = ipInfo->dst;
+    pseudo.src = ipInfo->src.ip4;
+    pseudo.dst = ipInfo->dst.ip4;
     pseudo.rsv = 0;
     pseudo.protocol = TCP_PROTO;
     pseudo.length = htons(tcpInfo->length + dataLen);
@@ -5162,9 +5139,10 @@ int TcpChecksum(IpInfo* ipInfo, TcpInfo* tcpInfo, int dataLen,
 /* Check IP and TCP headers, set payload */
 /* returns 0 on success, -1 on error */
 static int CheckHeaders(IpInfo* ipInfo, TcpInfo* tcpInfo, const byte* packet,
-                  int length, const byte** sslFrame, int* sslBytes, char* error)
+    int length, const byte** sslFrame, int* sslBytes, char* error, int checkReg)
 {
     IpHdr* iphdr = (IpHdr*)packet;
+    TcpHdr* tcphdr;
     int version;
 
     TraceHeader();
@@ -5186,16 +5164,33 @@ static int CheckHeaders(IpInfo* ipInfo, TcpInfo* tcpInfo, const byte* packet,
         }
     }
 
-    if (CheckIpHdr((IpHdr*)packet, ipInfo, length, error) != 0)
+    if (CheckIpHdr(iphdr, ipInfo, length, error) != 0)
         return -1;
+
+#ifndef WOLFSSL_SNIFFER_WATCH
+    if (checkReg &&
+           !IsServerRegistered(iphdr->src) && !IsServerRegistered(iphdr->dst)) {
+        SetError(SERVER_NOT_REG_STR, error, NULL, 0);
+        return -1;
+    }
+#endif
 
     /* tcp header */
     if (length < (ipInfo->length + TCP_HDR_SZ)) {
         SetError(PACKET_HDR_SHORT_STR, error, NULL, 0);
         return -1;
     }
-    if (CheckTcpHdr((TcpHdr*)(packet + ipInfo->length), tcpInfo, error) != 0)
+    tcphdr = (TcpHdr*)(packet + ipInfo->length);
+    if (CheckTcpHdr(tcphdr, tcpInfo, error) != 0)
         return -1;
+
+#ifndef WOLFSSL_SNIFFER_WATCH
+    if (checkReg &&
+         !IsPortRegistered(tcphdr->srcPort) && !IsPortRegistered(tcphdr->dstPort)) {
+        SetError(SERVER_PORT_NOT_REG_STR, error, NULL, 0);
+        return -1;
+    }
+#endif
 
     /* setup */
     *sslFrame = packet + ipInfo->length + tcpInfo->length;
@@ -5207,6 +5202,8 @@ static int CheckHeaders(IpInfo* ipInfo, TcpInfo* tcpInfo, const byte* packet,
     /* We only care about the data in the TCP/IP record. There may be extra
      * data after the IP record for the FCS for Ethernet. */
     *sslBytes = (int)(packet + ipInfo->total - *sslFrame);
+
+    (void)checkReg;
 
     return 0;
 }
@@ -6347,6 +6344,66 @@ static int RemoveFatalSession(IpInfo* ipInfo, TcpInfo* tcpInfo,
     return 0;
 }
 
+int ssl_DecodePacket_GetThreadNum(SnifferStreamInfo* info, int threadCount)
+{
+    uint8_t  infoSum = 0;
+    uint8_t* infoPtr = (uint8_t*)info;
+    int i, threadNum;
+
+    for (i=0; i<(int)sizeof(SnifferStreamInfo); i++) {
+        infoSum += infoPtr[i];
+    }
+    threadNum = infoSum % (threadCount-1);
+    printf("infoSum %u, thread %u\n", infoSum, threadNum);
+
+    return threadNum;
+}
+
+int ssl_DecodePacket_GetStream(const byte* packet, int length, int isChain,
+    SnifferStreamInfo* info, char* error )
+{
+    TcpInfo           tcpInfo;
+    IpInfo            ipInfo;
+    const byte*       sslFrame = NULL;
+    int               sslBytes = 0;
+#ifdef WOLFSSL_SNIFFER_CHAIN_INPUT
+    void* vChain = NULL;
+    word32 chainSz = 0;
+#endif
+
+    if (isChain) {
+#ifdef WOLFSSL_SNIFFER_CHAIN_INPUT
+        struct iovec* chain;
+        word32 i;
+
+        vChain = (void*)packet;
+        chainSz = (word32)length;
+
+        chain = (struct iovec*)vChain;
+        length = 0;
+        for (i = 0; i < chainSz; i++)
+            length += chain[i].iov_len;
+        packet = (const byte*)chain[0].iov_base;
+#else
+        return WOLFSSL_SNIFFER_ERROR;
+#endif
+    }
+
+    XMEMSET(&tcpInfo, 0, sizeof(tcpInfo));
+    XMEMSET(&ipInfo, 0, sizeof(ipInfo));
+
+    if (CheckHeaders(&ipInfo, &tcpInfo, packet, length, &sslFrame, &sslBytes,
+            error, 0) != 0) {
+        return WOLFSSL_SNIFFER_ERROR;
+    }
+
+    info->src     = ipInfo.src;
+    info->dst     = ipInfo.dst;
+    info->srcPort = tcpInfo.srcPort;
+    info->dstPort = tcpInfo.dstPort;
+
+    return 0;
+}
 
 /* Passes in an IP/TCP packet for decoding (ethernet/localhost frame) removed */
 /* returns Number of bytes on success, 0 for no data yet, and
@@ -6366,7 +6423,6 @@ static int ssl_DecodePacketInternal(const byte* packet, int length, int isChain,
     SnifferSession*   session = NULL;
     void* vChain = NULL;
     word32 chainSz = 0;
-
     if (isChain) {
 #ifdef WOLFSSL_SNIFFER_CHAIN_INPUT
         struct iovec* chain;
@@ -6387,8 +6443,9 @@ static int ssl_DecodePacketInternal(const byte* packet, int length, int isChain,
     }
 
     if (CheckHeaders(&ipInfo, &tcpInfo, packet, length, &sslFrame, &sslBytes,
-                     error) != 0)
+                     error, 1) != 0) {
         return WOLFSSL_SNIFFER_ERROR;
+    }
 
     end = sslFrame + sslBytes;
 
