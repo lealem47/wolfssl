@@ -472,6 +472,8 @@ static void show_usage(void)
 /* for each thread allocate memory, create mutex, create thread */
 typedef struct SnifferPacket {
     byte* packet;
+    int   prev;
+    int   nextPacket;
     int   length;
     int   lastRet;
     int   packetNumber;
@@ -610,12 +612,13 @@ static int wm_SemUnlock(wm_Sem *s){
 }
 
 #ifndef MAX_PACKETS_PER_THREAD
-#define MAX_PACKETS_PER_THREAD 1000
+#define MAX_PACKETS_PER_THREAD 100
 #endif
 typedef struct SnifferWorker {
     SnifferPacket packets[MAX_PACKETS_PER_THREAD];
     int          packetPos;
-    int          packetCounter; /* TODO: Track position */
+    int          lastPacket; /* TODO: Track position */
+    int          nextExpected;
     int          shutdown;
     int          port;
     char        *server;
@@ -633,6 +636,8 @@ static int ssl_Init_SnifferWorker(SnifferWorker* worker, int port,
     worker->port        = port;
     worker->shutdown    = 0;
     worker->packetPos   = 0;
+    worker->lastPacket  = 0;
+    worker->nextExpected= 0;
     worker->server      = (char*)XMALLOC(XSTRLEN(server), NULL,
                                          DYNAMIC_TYPE_TMP_BUFFER);
     worker->keyFilesSrc = (char*)XMALLOC(XSTRLEN(keyFilesSrc), NULL,
@@ -679,7 +684,7 @@ static void ssl_Free_SnifferWorker(SnifferWorker* worker)
 }
 
 static int SnifferWorkerPacketAdd(SnifferWorker* worker, int lastRet,
-        void* chain, int chainSz, int isChain, int packetNumber)
+        void* chain, int chainSz, int isChain, int packetNumber, int prev)
 {
     int ret = MEMORY_E, i, length;
     byte* packet;
@@ -719,12 +724,18 @@ static int SnifferWorkerPacketAdd(SnifferWorker* worker, int lastRet,
         worker->packets[ret].length = length;
         worker->packets[ret].lastRet = lastRet;
         worker->packets[ret].packetNumber = packetNumber;
+
+        if (worker->packets[prev].packet != NULL)
+            worker->packets[prev].nextPacket = packetNumber;
+
+        worker->lastPacket = ret;
+    
     }
     else {
         printf("\n\n Attempting to add packet %d \n\n", packetNumber); 
         wm_SemUnlock(&worker->sem);
         SnifferWorkerPacketAdd(worker, lastRet, chain, chainSz,
-                               isChain, packetNumber);
+                               isChain, packetNumber, prev);
         wm_SemLock(&worker->sem);
     }    
     
@@ -767,14 +778,22 @@ static void* snifferWorker(void* arg)
             worker->packetPos = 0;
 
         /* find the oldest one added to list */
-        for (i=worker->packetPos; i<MAX_PACKETS_PER_THREAD; i++) {
+       /* for (i=worker->packetPos; i<MAX_PACKETS_PER_THREAD; i++) {
             if (worker->packets[i].packet != NULL) {
                 current = i;
                 ++worker->packetPos;
                 break;
             }
-        }
+        }*/
  
+        for (i=worker->packetPos; i<MAX_PACKETS_PER_THREAD; i++) {
+            if (worker->packets[i].packet != NULL && worker->packets[i].packetNumber == worker->nextExpected ) {
+                current = i;
+                ++worker->packetPos;
+                break;
+            }
+        }
+
         chain   = worker->packets[current].packet;
         chainSz = worker->packets[current].length;
         data    = NULL; /* pointer to decrypted data */
@@ -853,9 +872,11 @@ static void* snifferWorker(void* arg)
 
         /* get lock */
         wm_SemLock(&worker->sem);
-        
+
         XFREE(worker->packets[current].packet, NULL, DYNAMIC_TYPE_TMP_BUFFER);
         worker->packets[current].packet = NULL;
+
+        worker->nextExpected = worker->packets[current].nextPacket;
 
         printf("Packet %d decoding complete\n",worker->packets[i].packetNumber);
         /* flag as complete */
@@ -1178,16 +1199,19 @@ int main(int argc, char** argv)
                                                           workerThreadCount); 
             printf("This %d should go to thread %d\n",packetNumber, threadNum); 
 
+            int prev;
             /* get lock on thread mutex */
             wm_SemLock(&workers[threadNum].sem);
+            prev =  workers[threadNum].lastPacket;
             /* find a free entry in the workers.packets */
     #if defined(WOLFSSL_ASYNC_CRYPT) || defined(WOLFSSL_SNIFFER_CHAIN_INPUT)
-            SnifferWorkerPacketAdd(&workers[threadNum], ret, chain, chainSz, isChain, packetNumber);
+            SnifferWorkerPacketAdd(&workers[threadNum], ret, chain, chainSz, isChain, packetNumber, prev);
     #else
-            SnifferWorkerPacketAdd(&workers[threadNum], ret, (void*)packet, header.caplen, isChain, packetNumber);
+            SnifferWorkerPacketAdd(&workers[threadNum], ret, (void*)packet, header.caplen, isChain, packetNumber, prev);
     #endif    
             wm_SemUnlock(&workers[threadNum].sem);
 
+            printf("prev is %d\n\n",++prev); 
         }
 
         /* check if we are done reading file */
