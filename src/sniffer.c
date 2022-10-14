@@ -2063,15 +2063,18 @@ static int CheckIp6Hdr(Ip6Hdr* iphdr, IpInfo* info, int length, char* error)
 /* Check IP Header for IPV4, TCP, and a registered server address */
 /* If header IPv6, pass to CheckIp6Hdr(). */
 /* returns 0 on success, -1 on error */
-static int CheckIpHdr(IpHdr* iphdr, IpInfo* info, int length, char* error)
+static int CheckIpHdr(IpHdr* iphdr, IpInfo* info, int length, char* error,
+                      int trace)
 {
     int version = IP_V(iphdr);
 
     if (version == IPV6)
         return CheckIp6Hdr((Ip6Hdr*)iphdr, info, length, error);
 
-    TraceIP(iphdr);
-    Trace(IP_CHECK_STR);
+    if (trace) {
+        TraceIP(iphdr);
+        Trace(IP_CHECK_STR);
+    }
 
     if (version != IPV4) {
         SetError(BAD_IPVER_STR, error, NULL, 0);
@@ -2099,10 +2102,13 @@ static int CheckIpHdr(IpHdr* iphdr, IpInfo* info, int length, char* error)
 
 /* Check TCP Header for a registered port */
 /* returns 0 on success, -1 on error */
-static int CheckTcpHdr(TcpHdr* tcphdr, TcpInfo* info, char* error)
+static int CheckTcpHdr(TcpHdr* tcphdr, TcpInfo* info, char* error, int trace)
 {
-    TraceTcp(tcphdr);
-    Trace(TCP_CHECK_STR);
+    if (trace) {
+        TraceTcp(tcphdr);
+        Trace(TCP_CHECK_STR);
+    }
+
     info->srcPort   = XNTOHS(tcphdr->srcPort);
     info->dstPort   = XNTOHS(tcphdr->dstPort);
     info->length    = TCP_LEN(tcphdr);
@@ -5139,14 +5145,17 @@ static int TcpChecksum(IpInfo* ipInfo, TcpInfo* tcpInfo, int dataLen,
 /* Check IP and TCP headers, set payload */
 /* returns 0 on success, -1 on error */
 static int CheckHeaders(IpInfo* ipInfo, TcpInfo* tcpInfo, const byte* packet,
-    int length, const byte** sslFrame, int* sslBytes, char* error, int checkReg)
+    int length, const byte** sslFrame, int* sslBytes, char* error,
+    int checkReg, int trace)
 {
     IpHdr* iphdr = (IpHdr*)packet;
     TcpHdr* tcphdr;
     int version;
 
-    TraceHeader();
-    TracePacket();
+    if (trace) {
+        TraceHeader();
+        TracePacket();
+    }
 
     /* ip header */
     if (length < IP_HDR_SZ) {
@@ -5164,7 +5173,7 @@ static int CheckHeaders(IpInfo* ipInfo, TcpInfo* tcpInfo, const byte* packet,
         }
     }
 
-    if (CheckIpHdr(iphdr, ipInfo, length, error) != 0)
+    if (CheckIpHdr(iphdr, ipInfo, length, error, trace) != 0)
         return -1;
 
 #ifndef WOLFSSL_SNIFFER_WATCH
@@ -5181,7 +5190,7 @@ static int CheckHeaders(IpInfo* ipInfo, TcpInfo* tcpInfo, const byte* packet,
         return -1;
     }
     tcphdr = (TcpHdr*)(packet + ipInfo->length);
-    if (CheckTcpHdr(tcphdr, tcpInfo, error) != 0)
+    if (CheckTcpHdr(tcphdr, tcpInfo, error, trace) != 0)
         return -1;
 
 #ifndef WOLFSSL_SNIFFER_WATCH
@@ -6354,7 +6363,6 @@ int ssl_DecodePacket_GetThreadNum(SnifferStreamInfo* info, int threadCount)
         infoSum += infoPtr[i];
     }
     threadNum = infoSum % (threadCount-1);
-    printf("infoSum %u, thread %u\n", infoSum, threadNum);
 
     return threadNum;
 }
@@ -6393,7 +6401,7 @@ int ssl_DecodePacket_GetStream(const byte* packet, int length, int isChain,
     XMEMSET(&ipInfo, 0, sizeof(ipInfo));
 
     if (CheckHeaders(&ipInfo, &tcpInfo, packet, length, &sslFrame, &sslBytes,
-            error, 0) != 0) {
+            error, 0, 0) != 0) {
         return WOLFSSL_SNIFFER_ERROR;
     }
 
@@ -6443,7 +6451,7 @@ static int ssl_DecodePacketInternal(const byte* packet, int length, int isChain,
     }
 
     if (CheckHeaders(&ipInfo, &tcpInfo, packet, length, &sslFrame, &sslBytes,
-                     error, 1) != 0) {
+                     error, 1, 1) != 0) {
         return WOLFSSL_SNIFFER_ERROR;
     }
 

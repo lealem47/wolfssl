@@ -625,30 +625,47 @@ typedef struct SnifferWorker {
     pthread_t    tid;
 } SnifferWorker;
 
-static void ssl_Init_SnifferWorker(SnifferWorker* worker, int port,
+static int ssl_Init_SnifferWorker(SnifferWorker* worker, int port,
         const char* server, const char* keyFilesSrc, const char* passwd)
 {
-    // TODO add casts to XMALLOC and create ssl_Free with wm_sem, check malloc return 
     wm_SemInit(&worker->sem);
 
     worker->port        = port;
     worker->shutdown    = 0;
     worker->packetPos   = 0;
-    worker->server      = XMALLOC(XSTRLEN(server), NULL,
-                                  DYNAMIC_TYPE_TMP_BUFFER);
-    XMEMCPY(worker->server, (char*)server, XSTRLEN(server));
+    worker->server      = (char*)XMALLOC(XSTRLEN(server), NULL,
+                                         DYNAMIC_TYPE_TMP_BUFFER);
+    worker->keyFilesSrc = (char*)XMALLOC(XSTRLEN(keyFilesSrc), NULL,
+                                         DYNAMIC_TYPE_TMP_BUFFER);
+
+    if (worker->server == NULL || worker->keyFilesSrc == NULL) {
+        XFREE(worker->server, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        XFREE(worker->keyFilesSrc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        return MEMORY_E;
+    }
+
     
-    worker->keyFilesSrc = XMALLOC(XSTRLEN(keyFilesSrc), NULL,
-                                 DYNAMIC_TYPE_TMP_BUFFER);
+    XMEMCPY(worker->server, (char*)server, XSTRLEN(server));
     XMEMCPY(worker->keyFilesSrc, (char*)keyFilesSrc, XSTRLEN(keyFilesSrc));
+
     if (passwd != NULL) { 
-        worker->passwd   = XMALLOC(XSTRLEN(passwd), NULL,
-                                  DYNAMIC_TYPE_TMP_BUFFER);
+        worker->passwd = (char*)XMALLOC(XSTRLEN(passwd), NULL,
+                                        DYNAMIC_TYPE_TMP_BUFFER);
+ 
+        if (worker->passwd == NULL) {
+            XFREE(worker->server, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            XFREE(worker->keyFilesSrc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            XFREE(worker->passwd, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            return MEMORY_E;
+        }
+
         XMEMCPY(worker->passwd, (char*)passwd, XSTRLEN(passwd));
     }
-    else{
-        worker->passwd   = NULL;
+    else {
+        worker->passwd = NULL;
     }
+
+    return 0;
 }
 
 static void ssl_Free_SnifferWorker(SnifferWorker* worker)
@@ -693,6 +710,7 @@ static int SnifferWorkerPacketAdd(SnifferWorker* worker, int lastRet,
     }
     /* TODO implement wait functionality */
     if (ret != MEMORY_E) {
+        printf("\n\nAdding packet %d to position %d\n\n", packetNumber,ret); 
         worker->packets[ret].packet = XMALLOC(length, NULL, DYNAMIC_TYPE_TMP_BUFFER);
         if (worker->packets[ret].packet == NULL) {
             return MEMORY_E;
@@ -701,8 +719,15 @@ static int SnifferWorkerPacketAdd(SnifferWorker* worker, int lastRet,
         worker->packets[ret].length = length;
         worker->packets[ret].lastRet = lastRet;
         worker->packets[ret].packetNumber = packetNumber;
-        printf("\n\n ADDED packet %d to position %d \n\n", packetNumber,ret); 
     }
+    else {
+        printf("\n\n Attempting to add packet %d \n\n", packetNumber); 
+        wm_SemUnlock(&worker->sem);
+        SnifferWorkerPacketAdd(worker, lastRet, chain, chainSz,
+                               isChain, packetNumber);
+        wm_SemLock(&worker->sem);
+    }    
+    
     (void)isChain;
 
     return ret;
@@ -712,58 +737,61 @@ static int SnifferWorkerPacketAdd(SnifferWorker* worker, int lastRet,
 static void* snifferWorker(void* arg)
 {
     SnifferWorker* worker = (SnifferWorker*)arg;
-    int i; 
-    int          j;
     int current = 0;
+    int i; 
+    int j;
     char         err[PCAP_ERRBUF_SIZE];
-    int wait = 0;
+
     ssl_Trace("./tracefile.txt", err);
     ssl_EnableRecovery(1, -1, err);
 #ifdef WOLFSSL_SNIFFER_WATCH
     ssl_SetWatchKeyCallback(myWatchCb, err);
 #endif
-    printf("Key isss %s\n",worker->keyFilesSrc);       
-    ///home/lealem/Desktop/Root_CA_Unsecured_RSA_key_2048.pem 
+
     load_key(NULL, worker->server, worker->port, worker->keyFilesSrc,
              worker->passwd, err);
-    
+
     while (1) {
+        //TODO comment about vars 
+        SSLInfo sslInfo;
+        int     ret; 
+        int     chainSz;
+        void*   chain;
+        byte*   data; /* pointer to decrypted data */
+
         /* get lock */
         wm_SemLock(&worker->sem);
-       
-        /* reset index */ 
+ 
+        /* reset index */
         if (worker->packetPos >= MAX_PACKETS_PER_THREAD)
             worker->packetPos = 0;
 
         /* find the oldest one added to list */
         for (i=worker->packetPos; i<MAX_PACKETS_PER_THREAD; i++) {
-            if (worker->packets[i].packet != NULL) { 
-                    current = i;
-                    ++worker->packetPos;
-                    break;
+            if (worker->packets[i].packet != NULL) {
+                current = i;
+                ++worker->packetPos;
+                break;
             }
         }
-                
-        int ret; 
-        SSLInfo sslInfo;
-        void* chain = worker->packets[current].packet;
-        int   chainSz = worker->packets[current].length;
-        byte* data = NULL; /* pointer to decrypted data */
+ 
+        chain   = worker->packets[current].packet;
+        chainSz = worker->packets[current].length;
+        data    = NULL; /* pointer to decrypted data */
 
+        wm_SemUnlock(&worker->sem);
 
         /* flag in progress */
 
-        wm_SemUnlock(&worker->sem);
+        if (worker->shutdown && chain == NULL)
+            break;
+
         if (chain == NULL) {
            continue;
         } 
-        (void)wait;
         /* if no work to be done and shutdown set then exit thread */
         /* TODO implement shutdown & indent below*/ 
-//        if (worker->shutdown)
- //           break;
 
-        //printf("Packet %d decoding complete\n",worker->packets[i].packetNumber);
         /* decode packet */
 #ifdef WOLFSSL_ASYNC_CRYPT
         /* For async call the original API again with same data,
@@ -786,7 +814,6 @@ static void* snifferWorker(void* arg)
             }
         }
 
-        // TODO Some of the below use packet and headcap.len instead of chain and chainsz
 #elif defined(WOLFSSL_SNIFFER_CHAIN_INPUT) && \
     defined(WOLFSSL_SNIFFER_STORE_DATA_CB)
         ret = ssl_DecodePacketWithChainSessionInfoStoreData(chain, chainSz,
@@ -808,7 +835,8 @@ static void* snifferWorker(void* arg)
 //        (void)ret;
 
         if (ret < 0) {
-            printf("ssl_Decode ret = %d, %s\n", ret, err);
+            printf("ssl_Decode ret = %d, %s on packet number %d\n", ret, err,
+                    worker->packets[current].packetNumber);
             // TODO USE BELOW and SAVE FILE ABOVE 
             //hadBadPacket = 1;
         }
@@ -828,11 +856,6 @@ static void* snifferWorker(void* arg)
         
         XFREE(worker->packets[current].packet, NULL, DYNAMIC_TYPE_TMP_BUFFER);
         worker->packets[current].packet = NULL;
-    /*    for (i=0; i<MAX_PACKETS_PER_THREAD; i++) {
-            if (worker->packets[i].packet != NULL) { 
-                    worker->packetPos = worker->packets[i].packetNumber;
-            }
-        }*/
 
         printf("Packet %d decoding complete\n",worker->packets[i].packetNumber);
         /* flag as complete */
@@ -840,7 +863,7 @@ static void* snifferWorker(void* arg)
 
         wm_SemUnlock(&worker->sem);
     
-        }; /* while */
+    }; /* while */
 
     return NULL;
 }
@@ -1149,19 +1172,21 @@ int main(int argc, char** argv)
             memset(&info, 0, sizeof(SnifferStreamInfo));
 
             /* determine thread to handle stream */
-            ret= ssl_DecodePacket_GetStream(chain, chainSz, isChain, &info, err); //working
-            printf("\n\n THE src port is %d and the dst port is %d\n\n",info.srcPort,ret); 
-            int threadNum = ssl_DecodePacket_GetThreadNum(&info, workerThreadCount);//working 
+            ret = ssl_DecodePacket_GetStream(chain, chainSz, isChain, &info,
+                                             err);
+            int threadNum = ssl_DecodePacket_GetThreadNum(&info,
+                                                          workerThreadCount); 
             printf("This %d should go to thread %d\n",packetNumber, threadNum); 
-            /* TODO: Allocate the SnifferPacket - See SnifferAsyncQueueAdd */
+
             /* get lock on thread mutex */
             wm_SemLock(&workers[threadNum].sem);
             /* find a free entry in the workers.packets */
-
+    #if defined(WOLFSSL_ASYNC_CRYPT) || defined(WOLFSSL_SNIFFER_CHAIN_INPUT)
+            SnifferWorkerPacketAdd(&workers[threadNum], ret, chain, chainSz, isChain, packetNumber);
+    #else
             SnifferWorkerPacketAdd(&workers[threadNum], ret, (void*)packet, header.caplen, isChain, packetNumber);
-
+    #endif    
             wm_SemUnlock(&workers[threadNum].sem);
-
 
         }
 
@@ -1172,16 +1197,16 @@ int main(int argc, char** argv)
 
     }
     
-    for (i=0; i<workerThreadCount; i++) {
-            workers[i].shutdown = 1;
-            pthread_join(workers[i].tid, NULL);
-        }
-        for (i=0; i<workerThreadCount; i++) {
-           ssl_Free_SnifferWorker(&workers[i]);
-        
-        }
-
     
+    for (i=0; i<workerThreadCount; i++) {
+        workers[i].shutdown = 1;
+        pthread_join(workers[i].tid, NULL);
+    }
+    for (i=0; i<workerThreadCount; i++) {
+       ssl_Free_SnifferWorker(&workers[i]);
+    
+    }
+
     FreeAll();
     (void)isChain;
 
