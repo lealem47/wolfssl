@@ -6362,7 +6362,7 @@ int ssl_DecodePacket_GetThreadNum(SnifferStreamInfo* info, int threadCount)
     for (i=0; i<(int)sizeof(SnifferStreamInfo); i++) {
         infoSum += infoPtr[i];
     }
-    threadNum = infoSum % (threadCount-1);
+    threadNum = infoSum % threadCount;
 
     return threadNum;
 }
