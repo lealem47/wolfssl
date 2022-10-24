@@ -38,6 +38,10 @@
     #define WOLFSSL_SNIFFER
 #endif
 
+#ifdef THREADED_SNIFFTEST
+#include <pthread.h>
+#endif
+
 #ifndef WOLFSSL_SNIFFER
 #ifndef NO_MAIN_DRIVER
 /* blank build */
@@ -476,8 +480,9 @@ typedef struct SnifferPacket {
     int   lastRet;
     int   packetNumber;
 #ifdef THREADED_SNIFFTEST
-    int   prev;
-    int   nextPacket;
+    struct SnifferPacket* next;
+    struct SnifferPacket* prev;
+    int    valid;
 #endif
 } SnifferPacket;
 
@@ -575,10 +580,8 @@ static int SnifferAsyncPollQueue(byte** data, char* err, SSLInfo* sslInfo,
 
 #ifdef THREADED_SNIFFTEST
 
-const int workerThreadCount = 4;
+const int workerThreadCount = 5;
 
-
-#include <pthread.h>
 typedef struct {
     volatile int lockCount;
     pthread_mutex_t mutex;
@@ -613,23 +616,18 @@ static int wm_SemUnlock(wm_Sem *s){
     return 0;
 }
 
-#ifndef MAX_PACKETS_PER_THREAD
-#define MAX_PACKETS_PER_THREAD 100
-#endif
-
 typedef struct SnifferWorker {
-    SnifferPacket packets[MAX_PACKETS_PER_THREAD];
-    int          packetPos;
-    int          lastPacket; /* TODO: Track position */
-    int          nextExpected;
-    int          shutdown;
-    int          hadBadPacket;
-    int          port;
-    char        *server;
-    char        *keyFilesSrc;
-    char        *passwd;
-    wm_Sem       sem;
-    pthread_t    tid;
+    SnifferPacket *head;
+    SnifferPacket *tail;
+    wm_Sem         sem;
+    pthread_t      tid;
+    char *server;
+    char *keyFilesSrc;
+    char *passwd;
+    int   port;
+    int   hadBadPacket;
+    int   lastProcessed;
+    int   shutdown;
 } SnifferWorker;
 
 static int ssl_Init_SnifferWorker(SnifferWorker* worker, int port,
@@ -637,62 +635,39 @@ static int ssl_Init_SnifferWorker(SnifferWorker* worker, int port,
 {
     wm_SemInit(&worker->sem);
 
-    worker->port        = port;
-    worker->shutdown    = 0;
-    worker->packetPos   = 0;
-    worker->lastPacket  = 0;
-    worker->nextExpected= 0;
     worker->server      = (char*)server;
     worker->keyFilesSrc = (char*)keyFilesSrc;
-    worker->passwd      = (char*)passwd; 
-    /*worker->server      = (char*)XMALLOC(XSTRLEN(server), NULL,
-                                         DYNAMIC_TYPE_TMP_BUFFER);
-    worker->keyFilesSrc = (char*)XMALLOC(XSTRLEN(keyFilesSrc), NULL,
-                                         DYNAMIC_TYPE_TMP_BUFFER);
+    worker->passwd      = (char*)passwd;
+    worker->port           = port;
+    worker->shutdown       = 0;
+    worker->lastProcessed  = 0;
 
-    if (worker->server == NULL || worker->keyFilesSrc == NULL) {
-        XFREE(worker->server, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        XFREE(worker->keyFilesSrc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    worker->head = XMALLOC(sizeof(SnifferPacket), NULL,
+                           DYNAMIC_TYPE_TMP_BUFFER);
+
+    if (worker->head == NULL) {
         return MEMORY_E;
     }
 
-    XMEMCPY(worker->server, (char*)server, XSTRLEN(server));
-    XMEMCPY(worker->keyFilesSrc, (char*)keyFilesSrc, XSTRLEN(keyFilesSrc));
+    worker->tail = worker->head; 
+    worker->head->valid = 0;
 
-    if (passwd != NULL) {
-        worker->passwd = (char*)XMALLOC(XSTRLEN(passwd), NULL,
-                                        DYNAMIC_TYPE_TMP_BUFFER);
- 
-        if (worker->passwd == NULL) {
-            XFREE(worker->server, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            XFREE(worker->keyFilesSrc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            XFREE(worker->passwd, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            return MEMORY_E;
-        }
-
-        XMEMCPY(worker->passwd, (char*)passwd, XSTRLEN(passwd));
-    }
-    else {
-        worker->passwd = NULL;
-    }
-*/
     return 0;
 }
 
 static void ssl_Free_SnifferWorker(SnifferWorker* worker)
 {
     wm_SemFree(&worker->sem);
-/*    XFREE(worker->server, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    XFREE(worker->keyFilesSrc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    if (worker->passwd != NULL) {
-        XFREE(worker->passwd, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-    }*/
+
+    if (worker->head != NULL) {
+        XFREE(worker->head, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    }
 }
 
 static int SnifferWorkerPacketAdd(SnifferWorker* worker, int lastRet,
-        void* chain, int chainSz, int isChain, int packetNumber, int prev)
+        void* chain, int chainSz, int isChain, int packetNumber)
 {
-    int ret = MEMORY_E, i, length;
+    int   length;
     byte* packet;
 
 #ifdef WOLFSSL_SNIFFER_CHAIN_INPUT
@@ -709,183 +684,173 @@ static int SnifferWorkerPacketAdd(SnifferWorker* worker, int lastRet,
         packet = (byte*)chain;
         length = chainSz;
     }
-
-    /* find first free idx */
-    for (i=0; i<MAX_PACKETS_PER_THREAD; i++) {
-        if (worker->packets[i].packet == NULL) {
-            if (ret == MEMORY_E) {
-                ret = i;
-                break;
-            }
-        }
+        
+    SnifferPacket* newEntry = XMALLOC(sizeof(SnifferPacket), NULL,
+                                      DYNAMIC_TYPE_TMP_BUFFER);
+    
+    newEntry->packet = XMALLOC(length, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (newEntry == NULL || newEntry->packet == NULL) {
+        return MEMORY_E;
     }
-    /* TODO implement wait functionality */
-    if (ret != MEMORY_E) {
-        printf("\n\nAdding packet %d to position %d\n\n", packetNumber,ret);
-        worker->packets[ret].packet = XMALLOC(length, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        if (worker->packets[ret].packet == NULL) {
-            return MEMORY_E;
-        }
-        XMEMCPY(worker->packets[ret].packet, packet, length);
-        worker->packets[ret].length = length;
-        worker->packets[ret].lastRet = lastRet;
-        worker->packets[ret].packetNumber = packetNumber;
+    XMEMCPY(newEntry->packet, packet, length);
+    newEntry->length = length;
+    newEntry->lastRet = lastRet;
+    newEntry->packetNumber = packetNumber;
+    newEntry->valid = 1;
 
-        if (worker->packets[prev].packet != NULL) {
-            worker->packets[prev].nextPacket = packetNumber;
-            //printf("FOR prev %d, NEXT EXP IS %d \n",prev, worker->packets[prev].nextPacket );
-        }
-        worker->lastPacket = ret;
-
+    if (worker->head->valid == 0) {
+        XFREE(worker->head, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        newEntry->next = newEntry; 
+        newEntry->prev = newEntry; 
+        worker->head = newEntry;
+        worker->tail = newEntry;
     }
     else {
-        printf("\n\n Attempting to add packet %d \n\n", packetNumber);
-        wm_SemUnlock(&worker->sem);
-        SnifferWorkerPacketAdd(worker, lastRet, chain, chainSz,
-                               isChain, packetNumber, prev);
-        wm_SemLock(&worker->sem);
-    }    
-    
+        newEntry->prev = worker->tail;
+        worker->tail->next = newEntry;
+        worker->tail = newEntry; 
+    }
+
     (void)isChain;
 
-    return ret;
+    return 0;
 
 }
+#endif /* THREADED_SNIFFTEST */
 
+static int DecodePacket(void* chain, int chainSz, int packetNumber, char err[])
+{
+    int     ret, j;
+    int     hadBadPacket = 0;
+    int     isChain = 0;
+    SSLInfo sslInfo;
+    byte*   data; /* pointer to decrypted data */
+
+    data = NULL;
+
+#ifdef WOLFSSL_SNIFFER_CHAIN_INPUT
+    isChain = 1;
+#endif
+
+    /* decode packet */
+#ifdef WOLFSSL_ASYNC_CRYPT
+    /* For async call the original API again with same data,
+        * or call with different sessions for multiple concurrent
+        * stream processing */
+    ret = ssl_DecodePacketAsync(chain, chainSz, isChain, &data, err,
+        &sslInfo, NULL);
+
+    /* WC_PENDING_E: Hardware is processing or stream is blocked
+        *               (waiting on WC_PENDING_E) */
+    if (ret == WC_PENDING_E) {
+        /* add to queue, for later processing */
+    #ifdef DEBUG_SNIFFER
+        printf("Steam is pending, queue packet %d\n", packetNumber);
+    #endif
+        ret = SnifferAsyncQueueAdd(ret, chain, chainSz, isChain,
+            packetNumber);
+        if (ret >= 0) {
+            ret = 0; /* mark event just added */
+        }
+    }
+
+#elif defined(WOLFSSL_SNIFFER_CHAIN_INPUT) && \
+defined(WOLFSSL_SNIFFER_STORE_DATA_CB)
+    ret = ssl_DecodePacketWithChainSessionInfoStoreData(chain, chainSz,
+            &data, &sslInfo, err);
+#elif defined(WOLFSSL_SNIFFER_CHAIN_INPUT)
+    (void)sslInfo;
+    ret = ssl_DecodePacketWithChain(chain, chainSz, &data, err);
+#else
+#if defined(WOLFSSL_SNIFFER_STORE_DATA_CB)
+    ret = ssl_DecodePacketWithSessionInfoStoreData(chain,
+            chainSz, &data, &sslInfo, err);
+#else
+    ret = ssl_DecodePacketWithSessionInfo(chain, chainSz, &data,
+                                            &sslInfo, err);
+#endif
+    (void)chain;
+    (void)chainSz;
+#endif
+
+    if (ret < 0) {
+        printf("ssl_Decode ret = %d, %s on packet number %d\n", ret, err,
+                packetNumber);
+        hadBadPacket = 1;
+    }
+
+    if (data != NULL && ret > 0) {
+        /* Convert non-printable data to periods. */
+        for (j = 0; j < ret; j++) {
+            if (isprint(data[j]) || isspace(data[j])) continue;
+            data[j] = '.';
+        }
+        data[ret] = 0;
+        printf("SSL App Data(%d:%d):%s\n", packetNumber, ret, data);
+        ssl_FreeZeroDecodeBuffer(&data, ret, err);
+    }
+
+    (void)isChain;
+
+    return hadBadPacket;
+}
+
+#ifdef THREADED_SNIFFTEST
 static void* snifferWorker(void* arg)
 {
     SnifferWorker* worker = (SnifferWorker*)arg;
-    int current = 0;
-    int i;
-    int j;
-    char         err[PCAP_ERRBUF_SIZE];
+    char err[PCAP_ERRBUF_SIZE];
 
     ssl_Trace("./tracefile.txt", err);
     ssl_EnableRecovery(1, -1, err);
 #ifdef WOLFSSL_SNIFFER_WATCH
     ssl_SetWatchKeyCallback(myWatchCb, err);
 #endif
+#ifdef WOLFSSL_SNIFFER_STORE_DATA_CB
+    ssl_SetStoreDataCallback(myStoreDataCb);
+#endif
 
     load_key(NULL, worker->server, worker->port, worker->keyFilesSrc,
              worker->passwd, err);
 
     while (1) {
-        //TODO comment about vars
-        SSLInfo sslInfo;
-        int     ret;
         int     packetNumber;
         int     chainSz;
         void*   chain;
-        byte*   data; /* pointer to decrypted data */
 
         /* get lock */
         wm_SemLock(&worker->sem);
  
-        /* reset index */
-        //if (worker->packetPos >= MAX_PACKETS_PER_THREAD)
-            worker->packetPos = 0;
-
-        /* find the oldest one added to list */
-       /* for (i=worker->packetPos; i<MAX_PACKETS_PER_THREAD; i++) {
-            if (worker->packets[i].packet != NULL) {
-                current = i;
-                ++worker->packetPos;
-                break;
-            }
-        }*/
- 
-        for (i=worker->packetPos; i<MAX_PACKETS_PER_THREAD; i++) {
-            if (worker->packets[i].packet != NULL && worker->packets[i].packetNumber == worker->nextExpected) {
-                current = i;
-                ++worker->packetPos;
-                break;
-            }
-        }
-
-        packetNumber = worker->packets[current].packetNumber;
-        chain        = worker->packets[current].packet;
-        chainSz      = worker->packets[current].length;
-        data         = NULL; /* pointer to decrypted data */
+        packetNumber = worker->head->packetNumber;
+        chain        = worker->head->packet;
+        chainSz      = worker->head->length;
 
         wm_SemUnlock(&worker->sem);
         /* flag in progress */
-
-        if (worker->shutdown && chain == NULL)
+        
+        if ((worker->shutdown && chain == NULL) || worker->head->valid == 0) {
             break;
-
-        if (chain == NULL) {
-           continue;
         }
 
-        /* decode packet */
-#ifdef WOLFSSL_ASYNC_CRYPT
-        /* For async call the original API again with same data,
-            * or call with different sessions for multiple concurrent
-            * stream processing */
-        ret = ssl_DecodePacketAsync(chain, chainSz, isChain, &data, err,
-            &sslInfo, NULL);
-
-        /* WC_PENDING_E: Hardware is processing or stream is blocked
-            *               (waiting on WC_PENDING_E) */
-        if (ret == WC_PENDING_E) {
-            /* add to queue, for later processing */
-        #ifdef DEBUG_SNIFFER
-            printf("Steam is pending, queue packet %d\n", packetNumber);
-        #endif
-            ret = SnifferAsyncQueueAdd(ret, chain, chainSz, isChain,
-                packetNumber);
-            if (ret >= 0) {
-                ret = 0; /* mark event just added */
-            }
+        if (worker->lastProcessed == worker->head->packetNumber) {
+            continue;
         }
 
-#elif defined(WOLFSSL_SNIFFER_CHAIN_INPUT) && \
-    defined(WOLFSSL_SNIFFER_STORE_DATA_CB)
-        ret = ssl_DecodePacketWithChainSessionInfoStoreData(chain, chainSz,
-                &data, &sslInfo, err);
-#elif defined(WOLFSSL_SNIFFER_CHAIN_INPUT)
-        (void)sslInfo;
-        ret = ssl_DecodePacketWithChain(chain, chainSz, &data, err);
-#else
-#if defined(WOLFSSL_SNIFFER_STORE_DATA_CB)
-        ret = ssl_DecodePacketWithSessionInfoStoreData(chain,
-                chainSz, &data, &sslInfo, err);
-#else
-        ret = ssl_DecodePacketWithSessionInfo(chain, chainSz, &data,
-                                                &sslInfo, err);
-#endif
-        (void)chain;
-        (void)chainSz;
-#endif
-//        (void)ret;
-
-        if (ret < 0) {
-            printf("ssl_Decode ret = %d, %s on packet number %d\n", ret, err,
-                    packetNumber);
-            worker->hadBadPacket = 1;
-        }
-
-        if (data != NULL && ret > 0) {
-            /* Convert non-printable data to periods. */
-            for (j = 0; j < ret; j++) {
-                if (isprint(data[j]) || isspace(data[j])) continue;
-                data[j] = '.';
-            }
-            data[ret] = 0;
-            printf("SSL App Data(%d:%d):%s\n", packetNumber, ret, data);
-            ssl_FreeZeroDecodeBuffer(&data, ret, err);
-        }
-
-       // printf("Packet %d decoding complete\n", packetNumber);
-
+        /* Decode Packet */
+        worker->hadBadPacket = DecodePacket(chain, chainSz, packetNumber, err);
+ 
         /* get lock */
         wm_SemLock(&worker->sem);
+        worker->lastProcessed = packetNumber;
 
-        XFREE(worker->packets[current].packet, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        worker->packets[current].packet = NULL;
-
-        worker->nextExpected = worker->packets[current].nextPacket;
-        //printf("NEXT EXP IS %d and position is %d\n", worker->nextExpected, worker->packetPos);
+        XFREE(worker->head->packet, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        worker->head->packet = NULL;
+       
+        if (worker->head->next) { 
+            worker->head = worker->head->next; 
+            XFREE(worker->head->prev, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            worker->head->prev = NULL;
+        }
 
         wm_SemUnlock(&worker->sem);
 
@@ -895,8 +860,6 @@ static void* snifferWorker(void* arg)
 }
 #endif /* THREADED_SNIFFTEST */
 
-
-
 int main(int argc, char** argv)
 {
     int          ret = 0;
@@ -905,6 +868,7 @@ int main(int argc, char** argv)
     int          port = 0;
     int          saveFile = 0;
     int          i = 0, defDev = 0;
+    int          packetNumber = 0;
     int          frame = ETHER_IF_FRAME_LEN;
     char         err[PCAP_ERRBUF_SIZE];
     char         filter[32];
@@ -921,7 +885,9 @@ int main(int argc, char** argv)
     struct iovec chains[CHAIN_INPUT_COUNT];
     unsigned int remainder;
 #endif
-    int packetNumber = 0;
+#ifdef THREADED_SNIFFTEST
+    SnifferWorker workers[workerThreadCount];
+#endif
 
     show_appinfo();
 
@@ -1128,29 +1094,27 @@ int main(int argc, char** argv)
     if (pcap_datalink(pcap) == DLT_NULL)
         frame = NULL_IF_FRAME_LEN;
 
-
-
-    SnifferWorker workers[workerThreadCount];
-    memset(&workers, 0, sizeof(workers));
+#ifdef THREADED_SNIFFTEST
+    XMEMSET(&workers, 0, sizeof(workers));
 
     for (i=0; i<workerThreadCount; i++) {
         ssl_Init_SnifferWorker(&workers[i], port, server, keyFilesSrc, passwd);
         pthread_create(&workers[i].tid, NULL, snifferWorker, &workers[i]);
     }
+#endif
 
     while (1) {
         struct pcap_pkthdr header;
         const unsigned char* packet = NULL;
-        //SSLInfo sslInfo;
         void* chain = NULL;
         int   chainSz = 0;
         byte* data = NULL; /* pointer to decrypted data */
 #ifdef WOLFSSL_ASYNC_CRYPT
+        SSLInfo sslInfo;
         int queueSz = 0;
 #endif
 #ifdef THREADED_SNIFFTEST
         SnifferStreamInfo info;
-        int prev;
 #endif
 #ifndef WOLFSSL_ASYNC_CRYPT
         ret = 0; /* reset status */
@@ -1199,8 +1163,9 @@ int main(int argc, char** argv)
             chain = (void*)packet;
             chainSz = header.caplen;
 #endif
-
-            memset(&info, 0, sizeof(SnifferStreamInfo));
+            
+#ifdef THREADED_SNIFFTEST
+            XMEMSET(&info, 0, sizeof(SnifferStreamInfo));
 
             /* determine thread to handle stream */
             ret = ssl_DecodePacket_GetStream(chain, chainSz, isChain, &info,
@@ -1208,19 +1173,30 @@ int main(int argc, char** argv)
             int threadNum = ssl_DecodePacket_GetThreadNum(&info,
                                                           workerThreadCount);
 
-            //printf(" %d thread for packetNum %d \n",threadNum, packetNumber);
             /* get lock on thread mutex */
             wm_SemLock(&workers[threadNum].sem);
-            prev =  workers[threadNum].lastPacket;
             /* find a free entry in the workers.packets */
     #if defined(WOLFSSL_ASYNC_CRYPT) || defined(WOLFSSL_SNIFFER_CHAIN_INPUT)
-            SnifferWorkerPacketAdd(&workers[threadNum], ret, chain, chainSz, isChain, packetNumber, prev);
+            SnifferWorkerPacketAdd(&workers[threadNum], ret, chain, chainSz, isChain, packetNumber);
     #else
-            SnifferWorkerPacketAdd(&workers[threadNum], ret, (void*)packet, header.caplen, isChain, packetNumber, prev);
+            SnifferWorkerPacketAdd(&workers[threadNum], ret, (void*)packet, header.caplen, isChain, packetNumber);
     #endif    
             wm_SemUnlock(&workers[threadNum].sem);
-        }
+#else
 
+    #if defined(WOLFSSL_ASYNC_CRYPT) || defined(WOLFSSL_SNIFFER_CHAIN_INPUT)
+            ret = DecodePacket(chain, chainSz, packetNumber);
+    #else
+            ret = DecodePacket((void*)packet, header.caplen, packetNumber);
+
+            (void)chain;
+            (void)chainSz;
+    #endif    
+            if (ret) {
+                hadBadPacket = 1;
+            } 
+#endif
+        }
         /* check if we are done reading file */
         if (packet == NULL && data == NULL && saveFile) {
             break;
@@ -1229,13 +1205,19 @@ int main(int argc, char** argv)
     }
     
     
+#ifdef THREADED_SNIFFTEST
     for (i=0; i<workerThreadCount; i++) {
         workers[i].shutdown = 1;
         pthread_join(workers[i].tid, NULL);
     }
+
     for (i=0; i<workerThreadCount; i++) {
-       ssl_Free_SnifferWorker(&workers[i]);
+        if (workers[i].hadBadPacket) {
+           hadBadPacket = 1;
+        } 
+        ssl_Free_SnifferWorker(&workers[i]);
     }
+#endif
 
     FreeAll();
     (void)isChain;
