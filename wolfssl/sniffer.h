@@ -298,10 +298,6 @@ WOLFSSL_API
 SSL_SNIFFER_API int ssl_DecodePacket_GetStream(const byte* packet, int length,
         int isChain, SnifferStreamInfo* info, char* error);
 
-WOLFSSL_API
-SSL_SNIFFER_API int ssl_DecodePacket_GetThreadNum(SnifferStreamInfo* info,
-        int threadCount);
-
 #ifdef WOLFSSL_ASYNC_CRYPT
 
 WOLFSSL_API

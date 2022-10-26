@@ -6353,20 +6353,6 @@ static int RemoveFatalSession(IpInfo* ipInfo, TcpInfo* tcpInfo,
     return 0;
 }
 
-int ssl_DecodePacket_GetThreadNum(SnifferStreamInfo* info, int threadCount)
-{
-    uint8_t  infoSum = 0;
-    uint8_t* infoPtr = (uint8_t*)info;
-    int i, threadNum;
-
-    for (i=0; i<(int)sizeof(SnifferStreamInfo); i++) {
-        infoSum += infoPtr[i];
-    }
-    threadNum = infoSum % threadCount;
-
-    return threadNum;
-}
-
 int ssl_DecodePacket_GetStream(const byte* packet, int length, int isChain,
     SnifferStreamInfo* info, char* error )
 {
