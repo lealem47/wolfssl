@@ -788,6 +788,8 @@ then
     test "$enable_session_ticket" = "" && enable_session_ticket=yes
     test "$enable_earlydata" = "" && enable_earlydata=yes
     test "$enable_ech" = "" && enable_ech=yes
+    test "$enable_haproxy" = "" && enable_haproxy=yes
+    test "$enable_quic" = "" && enable_quic=yes
 
     if test "$ENABLED_32BIT" != "yes"
     then
